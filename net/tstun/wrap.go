@@ -135,9 +135,14 @@ type Wrapper struct {
 	PreFilterIn FilterFunc
 	// PostFilterIn is the inbound filter function that runs after the main filter.
 	PostFilterIn FilterFunc
-	// PreFilterOut is the outbound filter function that runs before the main filter
-	// and therefore sees the packets that may be later dropped by it.
-	PreFilterOut FilterFunc
+	// PreFilterOutNetstack is the outbound filter function that runs before the main filter
+	// and therefore sees the packets that may be later dropped by it. This filter,
+	// if set, runs before PreFilterOutEngine.
+	PreFilterOutNetstack FilterFunc
+	// PreFilterOutEngine is the outbound filter function that runs before the main filter
+	// and therefore sees the packets that may be later dropped by it. The
+	// PreFilterOutNetstack filter, if set, runs before this filter.
+	PreFilterOutEngine FilterFunc
 	// PostFilterOut is the outbound filter function that runs after the main filter.
 	PostFilterOut FilterFunc
 
@@ -451,9 +456,16 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 		return filter.DropSilently
 	}
 
-	if t.PreFilterOut != nil {
-		if res := t.PreFilterOut(p, t); res.IsDrop() {
-			// Handled by userspaceEngine.handleLocalPackets (quad-100 DNS primarily).
+	if t.PreFilterOutNetstack != nil {
+		if res := t.PreFilterOutNetstack(p, t); res.IsDrop() {
+			// Handled by netstack.Impl.handleLocalPackets (quad-100 DNS primarily)
+			return res
+		}
+	}
+	if t.PreFilterOutEngine != nil {
+		if res := t.PreFilterOutEngine(p, t); res.IsDrop() {
+			// Handled by userspaceEngine.handleLocalPackets (primarily handles
+			// quad-100 if netstack is not installed).
 			return res
 		}
 	}
