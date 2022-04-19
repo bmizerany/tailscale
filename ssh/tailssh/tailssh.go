@@ -123,18 +123,44 @@ func (srv *server) newSSHServer() (*ssh.Server, error) {
 		Version:                     "SSH-2.0-Tailscale",
 		LocalPortForwardingCallback: srv.mayForwardLocalPortTo,
 		NoClientAuthCallback: func(m gossh.ConnMetadata) (*gossh.Permissions, error) {
-			if srv.requiresPubKey(m.User(), toIPPort(m.LocalAddr()), toIPPort(m.RemoteAddr())) {
-				return nil, errors.New("public key required") // any non-nil error will do
+			ci, err := srv.connInfo(m.User(), toIPPort(m.LocalAddr()), toIPPort(m.RemoteAddr()), nil)
+			if err != nil {
+				return nil, err
 			}
-			return nil, nil
+			if _, yes := srv.canConnect(ci); yes {
+				// Policy doesn't require a public key.
+				return nil, nil
+			}
+			return nil, errors.New("public key required") // any non-nil error will do
 		},
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
-			if srv.acceptPubKey(ctx.User(), toIPPort(ctx.LocalAddr()), toIPPort(ctx.RemoteAddr()), key) {
+			ci, err := srv.connInfo(ctx.User(), toIPPort(ctx.LocalAddr()), toIPPort(ctx.RemoteAddr()), key)
+			if err != nil {
+				return false
+			}
+			if _, yes := srv.canConnect(ci); yes {
 				srv.logf("accepting SSH public key %s", bytes.TrimSpace(gossh.MarshalAuthorizedKey(key)))
 				return true
 			}
 			srv.logf("rejecting SSH public key %s", bytes.TrimSpace(gossh.MarshalAuthorizedKey(key)))
 			return false
+		},
+		ServerConfigCallback: func(ctx ssh.Context) *gossh.ServerConfig {
+			return &gossh.ServerConfig{
+				BannerCallback: func(m gossh.ConnMetadata) string {
+					ci, err := srv.connInfo(ctx.User(), toIPPort(ctx.LocalAddr()), toIPPort(ctx.RemoteAddr()), nil)
+					if err != nil {
+						return err.Error()
+					}
+					if _, yes := srv.canConnect(ci); yes {
+						return ""
+					}
+					if srv.havePubKeyPolicy(ci) {
+						return ""
+					}
+					return "no matching policy\r\n"
+				},
+			}
 		},
 	}
 	for k, v := range ssh.DefaultRequestHandlers {
@@ -167,33 +193,20 @@ func (srv *server) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string
 	return ss.action.AllowLocalPortForwarding
 }
 
-// requiresPubKey reports whether the SSH server, during the auth negotiation
-// phase, should requires that the client send an SSH public key. (or, more
-// specifically, that "none" auth isn't acceptable)
-func (srv *server) requiresPubKey(sshUser string, localAddr, remoteAddr netaddr.IPPort) bool {
+// havePubKeyPolicy reports whether any policy may provide access by means of a
+// ssh.PublicKey.
+func (srv *server) havePubKeyPolicy(ci *sshConnInfo) bool {
+	// Is there any rule that looks like it'd require a public key for this
+	// sshUser?
 	pol, ok := srv.sshPolicy()
 	if !ok {
 		return false
 	}
-	a, ci, _, err := srv.evaluatePolicy(sshUser, localAddr, remoteAddr, nil)
-	if err == nil && (a.Accept || a.HoldAndDelegate != "") {
-		// Policy doesn't require a public key.
-		return false
-	}
-	if ci == nil {
-		// If we didn't get far enough along through evaluatePolicy to know the Tailscale
-		// identify of the remote side then it's going to fail quickly later anyway.
-		// Return false to accept "none" auth and reject the conn.
-		return false
-	}
-
-	// Is there any rule that looks like it'd require a public key for this
-	// sshUser?
 	for _, r := range pol.Rules {
 		if ci.ruleExpired(r) {
 			continue
 		}
-		if mapLocalUser(r.SSHUsers, sshUser) == "" {
+		if mapLocalUser(r.SSHUsers, ci.sshUser) == "" {
 			continue
 		}
 		for _, p := range r.Principals {
@@ -205,12 +218,19 @@ func (srv *server) requiresPubKey(sshUser string, localAddr, remoteAddr netaddr.
 	return false
 }
 
-func (srv *server) acceptPubKey(sshUser string, localAddr, remoteAddr netaddr.IPPort, pubKey ssh.PublicKey) bool {
-	a, _, _, err := srv.evaluatePolicy(sshUser, localAddr, remoteAddr, pubKey)
+func (srv *server) canConnect(ci *sshConnInfo) (lu *user.User, yes bool) {
+	a, localUser, err := srv.evaluatePolicy(ci)
 	if err != nil {
-		return false
+		return nil, false
 	}
-	return a.Accept || a.HoldAndDelegate != ""
+	if !a.Accept && a.HoldAndDelegate == "" {
+		return nil, false
+	}
+	lu, err = user.Lookup(localUser)
+	if err != nil {
+		return nil, false
+	}
+	return lu, true
 }
 
 // sshPolicy returns the SSHPolicy for current node.
@@ -253,42 +273,47 @@ func toIPPort(a net.Addr) (ipp netaddr.IPPort) {
 	return netaddr.IPPortFrom(tanetaddr, uint16(ta.Port))
 }
 
-// evaluatePolicy returns the SSHAction, sshConnInfo and localUser after
-// evaluating the sshUser and remoteAddr against the SSHPolicy. The remoteAddr
-// and localAddr params must be Tailscale IPs.
-//
-// The return sshConnInfo will be non-nil, even on some errors, if the
-// evaluation made it far enough to resolve the remoteAddr to a Tailscale IP.
-func (srv *server) evaluatePolicy(sshUser string, localAddr, remoteAddr netaddr.IPPort, pubKey ssh.PublicKey) (_ *tailcfg.SSHAction, _ *sshConnInfo, localUser string, _ error) {
-	pol, ok := srv.sshPolicy()
-	if !ok {
-		return nil, nil, "", fmt.Errorf("tailssh: rejecting connection; no SSH policy")
-	}
-	if !tsaddr.IsTailscaleIP(remoteAddr.IP()) {
-		return nil, nil, "", fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", remoteAddr)
-	}
-	if !tsaddr.IsTailscaleIP(localAddr.IP()) {
-		return nil, nil, "", fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", localAddr)
-	}
-	node, uprof, ok := srv.lb.WhoIs(remoteAddr)
-	if !ok {
-		return nil, nil, "", fmt.Errorf("unknown Tailscale identity from src %v", remoteAddr)
-	}
+func (srv *server) connInfo(sshUser string, localAddr, remoteAddr netaddr.IPPort, pubKey ssh.PublicKey) (*sshConnInfo, error) {
 	ci := &sshConnInfo{
 		now:                srv.now(),
 		fetchPublicKeysURL: srv.fetchPublicKeysURL,
 		sshUser:            sshUser,
 		src:                remoteAddr,
 		dst:                localAddr,
-		node:               node,
-		uprof:              &uprof,
 		pubKey:             pubKey,
+	}
+	if !tsaddr.IsTailscaleIP(remoteAddr.IP()) {
+		return ci, fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", remoteAddr)
+	}
+	if !tsaddr.IsTailscaleIP(localAddr.IP()) {
+		return ci, fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", localAddr)
+	}
+	node, uprof, ok := srv.lb.WhoIs(remoteAddr)
+	if !ok {
+		return ci, fmt.Errorf("unknown Tailscale identity from src %v", remoteAddr)
+	}
+
+	ci.node = node
+	ci.uprof = &uprof
+	return ci, nil
+}
+
+// evaluatePolicy returns the SSHAction, sshConnInfo and localUser after
+// evaluating the sshUser and remoteAddr against the SSHPolicy. The remoteAddr
+// and localAddr params must be Tailscale IPs.
+//
+// The return sshConnInfo will be non-nil, even on some errors, if the
+// evaluation made it far enough to resolve the remoteAddr to a Tailscale IP.
+func (srv *server) evaluatePolicy(ci *sshConnInfo) (_ *tailcfg.SSHAction, localUser string, _ error) {
+	pol, ok := srv.sshPolicy()
+	if !ok {
+		return nil, "", fmt.Errorf("tailssh: rejecting connection; no SSH policy")
 	}
 	a, localUser, ok := evalSSHPolicy(pol, ci)
 	if !ok {
-		return nil, ci, "", fmt.Errorf("ssh: access denied for %q from %v", uprof.LoginName, ci.src.IP())
+		return nil, "", fmt.Errorf("ssh: access denied for %q from %v", ci.uprof.LoginName, ci.src.IP())
 	}
-	return a, ci, localUser, nil
+	return a, localUser, nil
 }
 
 // pubKeyCacheEntry is the cache value for an HTTPS URL of public keys (like
@@ -391,7 +416,13 @@ func (srv *server) handleSSH(s ssh.Session) {
 	logf := srv.logf
 
 	sshUser := s.User()
-	action, ci, localUser, err := srv.evaluatePolicy(sshUser, toIPPort(s.LocalAddr()), toIPPort(s.RemoteAddr()), s.PublicKey())
+	ci, err := srv.connInfo(sshUser, toIPPort(s.LocalAddr()), toIPPort(s.RemoteAddr()), s.PublicKey())
+	if err != nil {
+		logf(err.Error())
+		s.Exit(1)
+		return
+	}
+	action, localUser, err := srv.evaluatePolicy(ci)
 	if err != nil {
 		logf(err.Error())
 		s.Exit(1)
@@ -524,7 +555,7 @@ func (srv *server) newSSHSession(s ssh.Session, ci *sshConnInfo, lu *user.User) 
 // If not, it terminates the session.
 func (ss *sshSession) checkStillValid() {
 	ci := ss.connInfo
-	a, _, lu, err := ss.srv.evaluatePolicy(ci.sshUser, ci.src, ci.dst, ci.pubKey)
+	a, lu, err := ss.srv.evaluatePolicy(ci)
 	if err == nil && (a.Accept || a.HoldAndDelegate != "") && lu == ss.localUser.Username {
 		return
 	}
