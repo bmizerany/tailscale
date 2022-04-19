@@ -1198,8 +1198,9 @@ func answerPing(logf logger.Logf, c *http.Client, pr *tailcfg.PingRequest, pinge
 		switch t {
 		case "TSMP", "disco":
 			go doPingerPing(logf, c, pr, pinger, t)
+		case "host":
+			go doPingerPing(logf, c, pr, &ICMPPinger{}, t)
 		// TODO(tailscale/corp#754)
-		// case "host":
 		// case "peerapi":
 		default:
 			logf("unsupported ping request type: %q", t)

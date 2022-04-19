@@ -12,9 +12,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +35,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/ping"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
@@ -45,7 +43,6 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
@@ -473,13 +470,7 @@ func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
 	return false
 }
 
-// setAmbientCapsRaw is non-nil on Linux for Synology, to run ping with
-// CAP_NET_RAW from tailscaled's binary.
-var setAmbientCapsRaw func(*exec.Cmd)
-
 var userPingSem = syncs.NewSemaphore(20) // 20 child ping processes at once
-
-var isSynology = runtime.GOOS == "linux" && distro.Get() == distro.Synology
 
 // userPing tried to ping dstIP and if it succeeds, injects pingResPkt
 // into the tundev.
@@ -500,34 +491,7 @@ func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
 	defer userPingSem.Release()
 
 	t0 := time.Now()
-	var err error
-	switch runtime.GOOS {
-	case "windows":
-		err = exec.Command("ping", "-n", "1", "-w", "3000", dstIP.String()).Run()
-	case "darwin":
-		// Note: 2000 ms is actually 1 second + 2,000
-		// milliseconds extra for 3 seconds total.
-		// See https://github.com/tailscale/tailscale/pull/3753 for details.
-		err = exec.Command("ping", "-c", "1", "-W", "2000", dstIP.String()).Run()
-	case "android":
-		ping := "/system/bin/ping"
-		if dstIP.Is6() {
-			ping = "/system/bin/ping6"
-		}
-		err = exec.Command(ping, "-c", "1", "-w", "3", dstIP.String()).Run()
-	default:
-		ping := "ping"
-		if isSynology {
-			ping = "/bin/ping"
-		}
-		cmd := exec.Command(ping, "-c", "1", "-W", "3", dstIP.String())
-		if isSynology && os.Getuid() != 0 {
-			// On DSM7 we run as non-root and need to pass
-			// CAP_NET_RAW if our binary has it.
-			setAmbientCapsRaw(cmd)
-		}
-		err = cmd.Run()
-	}
+	err := ping.Command(dstIP).Run()
 	d := time.Since(t0)
 	if err != nil {
 		if d < time.Second/2 {
