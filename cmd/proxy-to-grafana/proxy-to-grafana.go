@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"tailscale.com/client/tailscale"
+	"tailscale.com/paths"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
@@ -47,6 +48,7 @@ var (
 	backendAddr  = flag.String("backend-addr", "", "Address of the Grafana server served over HTTP, in host:port format. Typically localhost:nnnn.")
 	tailscaleDir = flag.String("state-dir", "./", "Alternate directory to use for Tailscale state storage. If empty, a default is used.")
 	useHTTPS     = flag.Bool("use-https", false, "Serve over HTTPS via your *.ts.net subdomain if enabled in Tailscale admin.")
+	socket       = flag.String("socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 )
 
 func main() {
@@ -67,6 +69,7 @@ func main() {
 		log.Fatalf("Error starting tsnet.Server: %v", err)
 	}
 	localClient, _ := ts.LocalClient()
+	localClient.Socket = *socket
 
 	url, err := url.Parse(fmt.Sprintf("http://%s", *backendAddr))
 	if err != nil {
@@ -84,7 +87,7 @@ func main() {
 	if *useHTTPS {
 		ln, err = ts.Listen("tcp", ":443")
 		ln = tls.NewListener(ln, &tls.Config{
-			GetCertificate: tailscale.GetCertificate,
+			GetCertificate: localClient.GetCertificate,
 		})
 
 		go func() {
